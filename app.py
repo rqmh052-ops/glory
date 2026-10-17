@@ -82,8 +82,6 @@ PING_TIMEOUT     = 8.0
 PING_URL         = "https://loginbp.ppmainecoonghj.com/Ping"
 PING_REAL_IP     = "103.109.214.211"
 
-FALLBACK_UID = ""
-FALLBACK_PASSWORD = ""
 
 # ═══════════════════════════ SQUAD CONFIG ═══════════════════════════
 TEAM_MODE               = True
@@ -2434,8 +2432,6 @@ def load_accounts():
                 data = json.load(f)
                 if isinstance(data, list): accounts = data
         except Exception as e: print_error(f"load: {e}")
-    if not accounts and FALLBACK_UID and FALLBACK_PASSWORD:
-        accounts.append({"uid": FALLBACK_UID, "password": FALLBACK_PASSWORD})
     return accounts
 
 # ═══════════════════════════ MAIN ═══════════════════════════

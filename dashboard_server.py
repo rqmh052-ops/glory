@@ -733,24 +733,6 @@ async def handle_add_account(request: web.Request) -> web.Response:
             existing.append({"uid": uid, "password": pwd})
             identifier = uid
 
-        elif "token" in data:
-            token = str(data["token"]).strip()
-            if not token:
-                return web.json_response({"status": "error", "error": "Token is required"})
-
-            # Cancel worker if token prefix matches
-            tok_key = token[:16]
-            for k in list(bot_state.account_workers.keys()):
-                if k == tok_key or k.startswith(tok_key[:10]) or tok_key.startswith(k[:10]):
-                    try:
-                        bot_state.account_workers[k].cancel()
-                    except Exception:
-                        pass
-                    bot_state.account_workers.pop(k, None)
-
-            existing = [acc for acc in existing if acc.get("token", "") != token]
-            existing.append({"token": token})
-            identifier = f"Token_{token[:8]}..."
         else:
             return web.json_response({"status": "error", "error": "Invalid payload"})
 
