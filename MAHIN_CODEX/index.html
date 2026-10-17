@@ -476,18 +476,18 @@
             <div class="card-header-flex">
                 <span class="card-title">Guild Live Tracker</span>
                 <div class="live-pill">
-                    <span class="pulse-dot"></span> RUNNING
+                    <span class="pulse-dot"></span> <span id="bot-status-text">LOADING</span>
                 </div>
             </div>
 
             <div class="guild-profile-row">
                 <img src="https://raw.githubusercontent.com/ronobiswas874-sketch/Images/refs/heads/main/1792063565823.png" alt="Logo" class="guild-avatar" onerror="this.src='https://via.placeholder.com/64/0f172a/38bdf8?text=G';">
                 <div class="guild-meta">
-                    <h3 id="info-clan-name">N/H</h3>
+                    <h3 id="info-clan-name">Loading...</h3>
                     <div class="guild-meta-tags">
-                        <span>ID:<span id="info-clan-id">3055517625</span></span>
-                        <span class="tag-region" id="info-clan-region">IND</span>
-                        <span class="tag-lvl">LV.<span id="info-clan-level">0</span></span>
+                        <span>ID:<span id="info-clan-id">3102027634</span></span>
+                        <span class="tag-region" id="info-clan-region">ME</span>
+                        <span class="tag-lvl">LV.<span id="info-clan-level">-</span></span>
                     </div>
                 </div>
             </div>
@@ -505,15 +505,15 @@
             <div class="metrics-grid">
                 <div class="metric-card">
                     <span>Initial</span>
-                    <strong id="info-clan-xp-old" style="color: var(--text-main);">0</strong>
+                    <strong id="info-clan-xp-old" style="color: var(--text-main);">-</strong>
                 </div>
                 <div class="metric-card">
                     <span>Current</span>
-                    <strong id="info-clan-xp-live">0</strong>
+                    <strong id="info-clan-xp-live">-</strong>
                 </div>
                 <div class="metric-card">
                     <span>Gained</span>
-                    <strong id="info-clan-xp-gained" style="color: #34d399;">+0</strong>
+                    <strong id="info-clan-xp-gained" style="color: #34d399;">-</strong>
                 </div>
             </div>
 
@@ -563,8 +563,8 @@
     </div>
 
     <script>
-        const DEFAULT_CLAN_ID = "3055517625";
-        const DEFAULT_REGION = "IND";
+        const DEFAULT_CLAN_ID = "3102027634";
+        const DEFAULT_REGION = "ME";
         let autoRefreshTimer = null;
         let isAllPaused = false;
 
@@ -582,7 +582,16 @@
                     headers: {'Content-Type': 'application/json'}
                 });
                 
-                if (!guildRes.ok) return;
+                if (!guildRes.ok) {
+                    let reason = 'Clan data unavailable';
+                    if (guildRes.status === 503) {
+                        reason = 'Waiting for a logged-in account';
+                    } else {
+                        try { const e = await guildRes.json(); if (e && e.error) reason = e.error; } catch (_) {}
+                    }
+                    document.getElementById('info-clan-name').textContent = reason;
+                    return;
+                }
 
                 const responseJson = await guildRes.json();
                 const guildData = responseJson.api_response ? responseJson.api_response.clan_basic_info : responseJson;
@@ -593,7 +602,7 @@
                     const gainedXp = Number(guildData.gained_exp || 0);
                     const clanLevel = guildData.clan_level || '1';
 
-                    document.getElementById('info-clan-name').textContent = guildData.clan_name || 'N/H';
+                    document.getElementById('info-clan-name').textContent = guildData.clan_name || '-';
                     document.getElementById('info-clan-id').textContent = guildData.clan_id || DEFAULT_CLAN_ID;
                     document.getElementById('info-clan-region').textContent = guildData.region || DEFAULT_REGION;
                     document.getElementById('info-clan-level').textContent = clanLevel;
@@ -615,7 +624,15 @@
                 });
                 if (!res.ok) return;
                 const stats = await res.json();
-                
+
+                const statusEl = document.getElementById('bot-status-text');
+                if (statusEl) {
+                    const accs = stats.accounts || [];
+                    statusEl.textContent = (stats.total_accounts || 0) === 0
+                        ? 'NO ACCOUNTS'
+                        : (accs.length > 0 && accs.every(a => a.is_paused) ? 'PAUSED' : 'RUNNING');
+                }
+
                 const uptimeSec = stats.uptime || 0;
                 document.getElementById('session-countdown').textContent = formatUptime(uptimeSec);
                 
