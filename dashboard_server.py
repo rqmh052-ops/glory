@@ -592,7 +592,7 @@ async def handle_api_clan_join(request: web.Request) -> web.Response:
         total_accounts = 0
         for uid, creds in token_cache.items():
             jwt_token = creds.get('token')
-            region = creds.get('region', 'IND')
+            region = creds.get('region', 'ME')
             if not jwt_token:
                 continue
             
@@ -647,7 +647,7 @@ def get_persisted_baseline_xp(clan_id, current_xp):
 async def handle_api_guild_info(request: web.Request) -> web.Response:
     try:
         clan_id = request.query.get('guild_id') or request.query.get('clan_uid') or request.query.get('clan_id')
-        region = (request.query.get('region') or 'IND').upper()
+        region = (request.query.get('region') or 'ME').upper()
         api_key = request.query.get('key')
 
         if not api_key or api_key != "XEROX_MODS":
