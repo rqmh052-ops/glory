@@ -53,7 +53,9 @@ MATCH_SEARCH_TIMEOUT   = 90.0
 MATCH_WATCHDOG_CHECK   = 30.0
 REGION_ROTATION_LIST   = ["ME", "ME", "ME"]  # Middle East / مينا
 REGION_ROTATE_EVERY_N  = 2
-MAX_SEARCH_ATTEMPTS    = 25
+# start-match requests per connection (one every ~6s) before reconnecting. Must stay above the
+# slowest squad formation (~230s) or members would drop out while the leader is still inviting.
+MAX_SEARCH_ATTEMPTS    = 40
 
 SAFE_PLAY_MODE        = True
 BYPASS_TIMING_JITTER  = True
@@ -98,6 +100,15 @@ TEAM_SIZE = 4
 TEAM_READY_DELAY = 5.0
 _accept_friend_request = True
 DEBUG_TEAM_PACKETS      = True
+
+# The search watchdog must outlive the whole squad-formation sequence, otherwise it cuts the
+# connection (default 90s == TEAM_PEER_WAIT_TIMEOUT) before the team is even created:
+#   peer wait + ready delay + create wait + invite loop + final wait + time to actually find a match
+SEARCH_TIMEOUT_EFFECTIVE = (
+    max(MATCH_SEARCH_TIMEOUT,
+        TEAM_PEER_WAIT_TIMEOUT + TEAM_READY_DELAY + TEAM_CREATE_WAIT
+        + TEAM_INVITE_MAX_TIME + TEAM_FINAL_WAIT + MATCH_SEARCH_TIMEOUT)
+    if TEAM_MODE else MATCH_SEARCH_TIMEOUT)
 
 # ═══════════════════════════ ANTI-BAN ═══════════════════════════
 def bypass_jitter(base, spread=0.35):
@@ -259,6 +270,19 @@ def get_proto_field(d, key, default=None):
     if str(key) in d:
         v = d[str(key)].get('data'); return v if v is not None else default
     return default
+
+# ═══════════════════════════ TASK HELPERS ═══════════════════════════
+async def cancel_and_wait(*tasks):
+    """Cancel tasks and wait for them to finish.
+    NOTE: `await task` on a cancelled task raises asyncio.CancelledError, which is a
+    BaseException (Python 3.8+) and is NOT caught by `except Exception`. gather(...,
+    return_exceptions=True) collects the children's CancelledError as results instead,
+    while a real cancellation of the caller still propagates."""
+    pending = [t for t in tasks if t is not None]
+    for t in pending:
+        if not t.done(): t.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
 
 # ═══════════════════════════ MATCH COUNTER ═══════════════════════════
 _match_counters: Dict[str, int] = {}
@@ -695,8 +719,11 @@ async def send_majorlogin(data, release_version, server_url):
         for off in [0, 64] + list(range(128)):
             try:
                 m = thunderFF_pb2.MajorLoginRes(); m.ParseFromString(c[off:])
-                if m.region and m.token: return m
+                # account_id must be non-zero: a mis-aligned offset can still yield region+token
+                # with account_id == 0 (this is what produced the "UID 0" account in the dashboard)
+                if m.region and m.token and m.account_id: return m
             except Exception: continue
+        print_error("[MAJORLOGIN] no valid response (account_id missing/0)")
         return None
     except Exception as e:
         print_error(f"[MAJORLOGIN] {e}"); return None
@@ -761,6 +788,12 @@ async def ping_worker(account_id, token, release_version, region="ID"):
     try:
         await asyncio.sleep(5.0 + random.uniform(0, 2.0))
         while True:
+            # use the latest token: an in-place re-login replaces the credentials
+            try:
+                _cur = bot_state.account_credentials.get(uid_str) or {}
+                token = _cur.get('token') or token
+                release_version = _cur.get('release_version') or release_version
+            except Exception: pass
             ok = await send_ping(uid_str, token, release_version)
             if ok:
                 ok_count += 1; fails = 0
@@ -1405,14 +1438,12 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
             if t:
                 try: await asyncio.wait_for(t, timeout=2.0)
                 except Exception:
-                    t.cancel()
-                    try: await t
-                    except Exception: pass
+                    # wait_for already cancelled t on timeout; awaiting a cancelled task raises
+                    # CancelledError, so collect it with gather instead of `await t`
+                    await cancel_and_wait(t)
         ping_stop.set()
         if ping_task:
-            ping_task.cancel()
-            try: await ping_task
-            except asyncio.CancelledError: pass
+            await cancel_and_wait(ping_task)
         if sock:
             try: sock.close()
             except Exception: pass
@@ -1620,7 +1651,8 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
     ip, port = addrs.split(":")
     play_matches: List[asyncio.Task] = []
     no_response_count = 0
-    search_attempts = 0
+    # number of start-match requests sent on the current connection (shown as att=N by the watchdog)
+    search_attempts_ref = {"n": 0}
     last_start_time = 0.0
     uid_str = str(account_id)
     current_level = int(account_level or 2)
@@ -1744,14 +1776,12 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
             if final_cnt < TEAM_SIZE:
                 print_error(f"[TEAM] Only {final_cnt}/{TEAM_SIZE} joined — abort, retry")
                 heartbeat_stop.set()
-                try: hb_task.cancel(); await hb_task
-                except Exception: pass
+                await cancel_and_wait(hb_task)
                 return
 
             await asyncio.sleep(TEAM_FINAL_WAIT)
             heartbeat_stop.set()
-            try: hb_task.cancel(); await hb_task
-            except Exception: pass
+            await cancel_and_wait(hb_task)
 
             print_success(f"[TEAM] 🚀 {uid_str} loop: ready → 1s → start (every 5s)")
             while _team_active["flag"]:
@@ -1769,6 +1799,7 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                     sm = start_match_team(int(oid), current_key, current_iv, region=account_region)
                     if _writer_ref["w"] and not _writer_ref["w"].is_closing():
                         _writer_ref["w"].write(sm); await _writer_ref["w"].drain()
+                        search_attempts_ref["n"] += 1
                 except Exception as e: print_warning(f"[TEAM] start err: {e}")
                 try: await asyncio.wait_for(asyncio.sleep(5.0), timeout=5.5)
                 except asyncio.TimeoutError: pass
@@ -1795,6 +1826,7 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                         await asyncio.sleep(1.0)
                         sm = start_match_team(int(my_id), current_key, current_iv, region=account_region)
                         _writer_ref["w"].write(sm); await _writer_ref["w"].drain()
+                        search_attempts_ref["n"] += 1
                 except Exception as e: print_warning(f"[TEAM] member trigger: {e}")
                 try: await asyncio.wait_for(asyncio.sleep(5.0), timeout=5.5)
                 except asyncio.TimeoutError: pass
@@ -1884,11 +1916,13 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
 
                 connection_start_time = asyncio.get_running_loop().time()
                 last_watchdog_check = connection_start_time
-                search_attempts = 0
+                search_attempts_ref["n"] = 0
                 if reconnect_count_total > 0 and (reconnect_count_total % REGION_ROTATE_EVERY_N == 0):
                     region_index = (region_index + 1) % len(REGION_ROTATION_LIST)
-                    current_search_region = REGION_ROTATION_LIST[region_index]
-                    print_warning(f"[REGION ROTATE] {uid_str} -> {current_search_region}")
+                    new_region = REGION_ROTATION_LIST[region_index]
+                    if new_region != current_search_region:   # only log a real change
+                        print_warning(f"[REGION ROTATE] {uid_str} -> {new_region}")
+                    current_search_region = new_region
                 else:
                     current_search_region = REGION_ROTATION_LIST[region_index]
 
@@ -1920,10 +1954,10 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                     if now - last_watchdog_check >= MATCH_WATCHDOG_CHECK:
                         last_watchdog_check = now
                         sd = now - connection_start_time
-                        if sd > 30: print_warning(f"[WATCHDOG] {uid_str} searching {int(sd)}s att={search_attempts}")
-                        if sd > MATCH_SEARCH_TIMEOUT:
+                        if sd > 30: print_warning(f"[WATCHDOG] {uid_str} searching {int(sd)}s att={search_attempts_ref['n']}")
+                        if sd > SEARCH_TIMEOUT_EFFECTIVE:
                             raise ConnectionError("Search watchdog")
-                    if search_attempts >= MAX_SEARCH_ATTEMPTS:
+                    if search_attempts_ref["n"] >= MAX_SEARCH_ATTEMPTS:
                         raise ConnectionError("Max attempts")
 
                     try:
@@ -2127,7 +2161,7 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
         raise
 
 # ═══════════════════════════ INFORMATIONAL ═══════════════════════════
-async def informational(addrs, starter_packet, key, iv, region="ID", max_reconnects=3):
+async def informational(addrs, starter_packet, key, iv, region="ID", max_reconnects=3, starter_getter=None):
     reconnects = 0
     ip, port = addrs.split(":")
     while True:
@@ -2137,6 +2171,10 @@ async def informational(addrs, starter_packet, key, iv, region="ID", max_reconne
             reader, writer = await asyncio.open_connection(rip, int(port))
             rs = writer.get_extra_info('socket')
             if rs: optimize_tcp_socket(rs)
+            # after an in-place re-login the original starter packet carries a stale token
+            if starter_getter:
+                try: starter_packet = (await starter_getter()) or starter_packet
+                except Exception: pass
             writer.write(bytes.fromhex(starter_packet)); await writer.drain()
             reconnects = 0
             try:
@@ -2340,6 +2378,21 @@ async def process_account_token(access_token):
     except Exception as e:
         print_error(f"process_account_token: {e}"); return None
 
+async def relogin_account_creds(uid_str, account_data):
+    """In-place credential renewal used by BotState.relogin_account (called from
+    functional_battle_royale on a cache miss). Forces a fresh login and returns the new
+    account-data dict, or None on failure. Credentials are re-registered by the login helpers."""
+    ad = account_data or bot_state.account_credentials.get(str(uid_str)) or {}
+    auth_type = ad.get('auth_type')
+    if auth_type == 'guest' and ad.get('auth_uid') and ad.get('auth_password'):
+        cache_invalidate(str(ad['auth_uid']))
+        return await process_account_uid_pass(str(ad['auth_uid']), ad['auth_password'])
+    if auth_type == 'token' and ad.get('auth_token'):
+        cache_invalidate(f"tok_{ad['auth_token'][:20]}")
+        return await process_account_token(ad['auth_token'])
+    print_error(f"[FUNC] relogin {uid_str}: no stored login method in account data")
+    return None
+
 async def run_account_worker(ad, label):
     acc_id = str(ad['account_id'])
     info_task = None; exp_task = None; ping_task = None
@@ -2351,8 +2404,14 @@ async def run_account_worker(ad, label):
         tcp_chat = await build_tcp_startup_packet(
             ad['account_id'], ad['token'], ad['server_time'],
             ad['aes_ak'], ad['iv_i'], region=reg, typ='ChaT')
+        async def _fresh_chat_starter():
+            cur = bot_state.account_credentials.get(acc_id) or ad
+            return await build_tcp_startup_packet(
+                cur['account_id'], cur['token'], cur['server_time'],
+                cur['aes_ak'], cur['iv_i'], region=cur.get('region', reg), typ='ChaT')
         info_task = asyncio.create_task(informational(ad['informational_addrs'], tcp_chat,
-                                                      ad['aes_ak'], ad['iv_i'], region=reg))
+                                                      ad['aes_ak'], ad['iv_i'], region=reg,
+                                                      starter_getter=_fresh_chat_starter))
         if ENABLE_HTTP_PING:
             ping_task = asyncio.create_task(ping_worker(acc_id, ad['token'], ad['release_version'], region=reg))
             print_success(f"[PING] Started {acc_id}")
@@ -2376,12 +2435,9 @@ async def run_account_worker(ad, label):
     except asyncio.CancelledError: raise
     except Exception as e: print_error(f"run_account_worker {label}: {e}")
     finally:
-        for t in (info_task, exp_task, ping_task):
-            if t and not t.done(): t.cancel()
-        for t in (info_task, exp_task, ping_task):
-            if t:
-                try: await t
-                except Exception: pass
+        # `await t` on a cancelled task raises CancelledError (a BaseException) which used to
+        # escape here and made account_loop_guest print "Worker stopped" and exit for good.
+        await cancel_and_wait(info_task, exp_task, ping_task)
 
 async def account_loop_guest(uid, password):
     while True:
@@ -2469,6 +2525,7 @@ async def main():
     try:
         bot_state.refresh_callbacks["on_account_added"] = on_account_added
         bot_state.refresh_callbacks["on_refresh_account"] = on_refresh_account
+        bot_state.refresh_callbacks["relogin_account"] = relogin_account_creds
     except Exception: pass
 
     accounts = load_accounts()

@@ -275,6 +275,20 @@ class BotState:
         self.account_credentials: Dict[str, Dict[str, Any]] = {}
         self.active_writers: Dict[str, set] = {}
 
+    async def relogin_account(self, uid: str, account_data: Optional[Dict[str, Any]] = None):
+        """Renew an account's credentials with a fresh login (called by the worker on a cache miss).
+        The actual login code lives in app.py (it imports this module, so it registers itself
+        through refresh_callbacks["relogin_account"] to avoid a circular import).
+        Returns the new account-data dict, or None if re-login is unavailable/failed."""
+        cb = self.refresh_callbacks.get("relogin_account")
+        if not cb:
+            self.log(f"Re-login unavailable for {uid}: no handler registered", "warning", uid)
+            return None
+        new_cred = await cb(str(uid), account_data)
+        if new_cred:
+            self.log(f"Credentials renewed for {uid}", "success", uid)
+        return new_cred
+
     def register_writer(self, uid: str, writer):
         uid_str = str(uid)
         if uid_str not in self.active_writers:
