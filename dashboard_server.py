@@ -75,9 +75,20 @@ def get_server_url(region):
     info = get_server_info(region)
     return info[0] if isinstance(info, tuple) else info
 
+def _account_endpoint(creds, region):
+    """Prefer the server and release version the account itself got at login
+    (same as app.py does); fall back to the static region map."""
+    creds = creds or {}
+    srv = str(creds.get("server_url") or "").strip()
+    rel = str(creds.get("release_version") or "").strip()
+    if srv:
+        base = srv.rstrip("/")
+        host = base.replace("https://", "").replace("http://", "").split("/")[0]
+    else:
+        base, host = get_server_info(region)
+    return base, host, rel
+
 def fetch_single_clan(clan_id, region, token_cache):
-    server_base, host = get_server_info(region)
-    url = f"{server_base}/GetClanInfoByClanID"
 
     try:  
         my_data = encode_id_clan_pb2.MyData()  
@@ -88,12 +99,18 @@ def fetch_single_clan(clan_id, region, token_cache):
         return {"clan_id": clan_id, "error": f"Protobuf failed: {str(e)}"}
 
     response = None
+    last_error = "no usable token"
     for uid, creds in token_cache.items():
         token = creds.get('token')
         if not token:
             continue
 
+        server_base, host, rel = _account_endpoint(creds, creds.get('region') or region)
+        url = f"{server_base}/GetClanInfoByClanID"
+
         headers = GAME_HEADERS.copy()
+        if rel:
+            headers["ReleaseVersion"] = rel
         headers["Authorization"] = f"Bearer {token}" if not token.startswith("Bearer ") else token
         headers["Host"] = host
 
@@ -103,15 +120,18 @@ def fetch_single_clan(clan_id, region, token_cache):
                 response = res
                 break
             elif "expired" in res.text.lower() or res.status_code == 401:
+                last_error = f"HTTP {res.status_code} (token expired)"
                 continue
             else:
+                last_error = f"HTTP {res.status_code}"
                 response = res
                 break
         except Exception as ex:
+            last_error = f"{type(ex).__name__} on {host}"
             continue
 
     if not response or response.status_code != 200:
-        return {"clan_id": clan_id, "error": "All tokens failed or expired"}
+        return {"clan_id": clan_id, "error": f"Clan lookup failed: {last_error}"}
 
     full_response = {}
     resp = None
@@ -147,12 +167,14 @@ def fetch_single_clan(clan_id, region, token_cache):
         "raw_response_bytes": response.content.hex()
     }
 
-async def request_clan_async(jwt_token, clan_id, region):
-    server_url = get_server_url(region)
+async def request_clan_async(jwt_token, clan_id, region, creds=None):
+    server_url, _host, rel = _account_endpoint(creds, region)
     msg = ReqCLan_pb2.MyMessage()
     msg.field_1 = int(clan_id)
     payload = encrypt_payload(msg.SerializeToString())
     headers = GAME_HEADERS.copy()
+    if rel:
+        headers["ReleaseVersion"] = rel
     headers["Authorization"] = f"Bearer {jwt_token}" if not jwt_token.startswith("Bearer ") else jwt_token
     url = f"{server_url}/RequestJoinClan"
     async with httpx.AsyncClient(verify=False, timeout=8.0) as client:
@@ -590,6 +612,7 @@ async def handle_api_clan_join(request: web.Request) -> web.Response:
 
         success_count = 0
         total_accounts = 0
+        last_status = None
         for uid, creds in token_cache.items():
             jwt_token = creds.get('token')
             region = creds.get('region', 'ME')
@@ -598,11 +621,18 @@ async def handle_api_clan_join(request: web.Request) -> web.Response:
             
             total_accounts += 1
             try:
-                status_code, text_resp = await request_clan_async(jwt_token, clan_id, region)
+                status_code, text_resp = await request_clan_async(jwt_token, clan_id, region, creds)
+                last_status = status_code
                 if status_code == 200:
                     success_count += 1
-            except Exception:
-                pass
+            except Exception as ex:
+                last_status = type(ex).__name__
+
+        try:
+            bot_state.log(f"Clan {clan_id} join request: {success_count}/{total_accounts} accepted (last response: {last_status})",
+                          "success" if success_count else "warning")
+        except Exception:
+            pass
 
         return web.json_response({
             'message': f'Clan join requests sent successfully for {success_count} / {total_accounts} accounts!'
