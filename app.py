@@ -53,9 +53,10 @@ MATCH_SEARCH_TIMEOUT   = 90.0
 MATCH_WATCHDOG_CHECK   = 30.0
 REGION_ROTATION_LIST   = ["ME", "ME", "ME"]  # Middle East / مينا
 REGION_ROTATE_EVERY_N  = 2
-# start-match requests per connection (one every ~6s) before reconnecting. Must stay above the
-# slowest squad formation (~230s) or members would drop out while the leader is still inviting.
-MAX_SEARCH_ATTEMPTS    = 40
+# start-match requests per connection (one every ~6s) before reconnecting. This is only a BACKUP
+# limit now: the resync supervisor below handles stalls first, so a single account is never cut
+# alone while the others keep waiting (that lone cut is what desynchronised the squad before).
+MAX_SEARCH_ATTEMPTS    = 80
 
 SAFE_PLAY_MODE        = True
 BYPASS_TIMING_JITTER  = True
@@ -99,7 +100,7 @@ TEAM_FINAL_WAIT         = 8.0
 TEAM_SIZE = 4
 TEAM_READY_DELAY = 5.0
 _accept_friend_request = True
-DEBUG_TEAM_PACKETS      = True
+DEBUG_TEAM_PACKETS      = False   # True floods the dashboard log (80-line window) and hides [TEAM] lines
 
 # The search watchdog must outlive the whole squad-formation sequence, otherwise it cuts the
 # connection (default 90s == TEAM_PEER_WAIT_TIMEOUT) before the team is even created:
@@ -109,6 +110,15 @@ SEARCH_TIMEOUT_EFFECTIVE = (
         TEAM_PEER_WAIT_TIMEOUT + TEAM_READY_DELAY + TEAM_CREATE_WAIT
         + TEAM_INVITE_MAX_TIME + TEAM_FINAL_WAIT + MATCH_SEARCH_TIMEOUT)
     if TEAM_MODE else MATCH_SEARCH_TIMEOUT)
+
+# ═══════════════════════════ SELF-HEALING (squad resync) ═══════════════════════════
+# If no squad becomes full and no match is found/played for this long, ALL accounts are
+# reconnected together (same effect as the manual Stop Bot -> Start, but automatic).
+RESYNC_STALL_SECONDS   = 240.0
+RESYNC_CHECK_INTERVAL  = 15.0
+RESYNC_DEBOUNCE        = 8.0     # ignore duplicate resync requests within this window
+TEAM_RETRY_DELAY       = 3.0     # pause between squad-formation rounds
+LEADER_RECHECK_INTERVAL = 2.0    # members re-check whether the leader is gone
 
 # ═══════════════════════════ ANTI-BAN ═══════════════════════════
 def bypass_jitter(base, spread=0.35):
@@ -316,7 +326,12 @@ _team_state = {
     "members": set(),
     "members_lock": asyncio.Lock(),
     "lock": asyncio.Lock(),
+    "last_progress": time.time(),   # last time a squad became full / a match started or ended
+    "resync_at": 0.0,
 }
+
+def _mark_progress():
+    _team_state["last_progress"] = time.time()
 
 async def _team_member_join(uid):
     uid = str(uid)
@@ -348,6 +363,47 @@ async def _team_member_reset(keep_leader=True):
         _team_state["members"].clear()
         if keep_leader and _team_state["leader_uid"]:
             _team_state["members"].add(_team_state["leader_uid"])
+
+async def _force_team_resync(reason):
+    """Drop every squad connection at once so all accounts reconnect together and the squad
+    re-forms from a clean, synchronised state. Accounts inside a match are left alone."""
+    now = time.time()
+    if now - _team_state.get("resync_at", 0.0) < RESYNC_DEBOUNCE:
+        return False
+    _team_state["resync_at"] = now
+    _mark_progress()
+    async with _team_state["lock"]:
+        writers = [(u, p.get("writer")) for u, p in _team_state["peers"].items()]
+        _team_state["leader_uid"] = None
+        _team_state["team_code"] = None
+        _team_state["pk_code"] = None
+    async with _team_state["members_lock"]:
+        _team_state["members"].clear()
+    print_warning(f"[RESYNC] {reason} -> reconnecting {len(writers)} account(s) together")
+    for u, w in writers:
+        try:
+            if w is not None and not w.is_closing(): w.close()
+        except Exception: pass
+    return True
+
+async def team_resync_supervisor():
+    while True:
+        try:
+            await asyncio.sleep(RESYNC_CHECK_INTERVAL)
+            if not TEAM_MODE: continue
+            if await _get_total_match_count() > 0:      # somebody is playing -> healthy
+                _mark_progress(); continue
+            async with _team_state["lock"]:
+                peers = list(_team_state["peers"].keys())
+            active = [u for u in peers if not bot_state.is_paused(u)]
+            if not active:                                # nobody connected (paused / logging in)
+                _mark_progress(); continue
+            idle = time.time() - max(_team_state["last_progress"], _team_state["resync_at"])
+            if idle >= RESYNC_STALL_SECONDS:
+                await _force_team_resync(f"no full squad / no match for {int(idle)}s")
+        except asyncio.CancelledError: raise
+        except Exception as e:
+            print_warning(f"[RESYNC] supervisor error: {e}")
 
 # ═══════════════════════════ TOKEN CACHE ═══════════════════════════
 _token_cache_memo = {}
@@ -1552,7 +1608,7 @@ async def _handle_team_invite(hex_data, pl, uid_str, current_account_data,
 
         candidates.sort(key=lambda x: len(x[2]) if isinstance(x[2], dict) else 0, reverse=True)
         best_off, decoder, dec = candidates[0]
-        print_info(f"[TEAM-IN {uid_str}] decoded@{best_off}/{decoder} fields={list(dec.keys())[:20]}")
+        if DEBUG_TEAM_PACKETS: print_info(f"[TEAM-IN {uid_str}] decoded@{best_off}/{decoder} fields={list(dec.keys())[:20]}")
 
         def _unwrap(d, keys):
             if not isinstance(d, dict): return None
@@ -1567,7 +1623,7 @@ async def _handle_team_invite(hex_data, pl, uid_str, current_account_data,
             u = _unwrap(dec, kp)
             if isinstance(u, dict) and len(u) >= 3:
                 target_dict = u
-                print_info(f"[TEAM-IN {uid_str}] nested@{kp[0]}")
+                if DEBUG_TEAM_PACKETS: print_info(f"[TEAM-IN {uid_str}] nested@{kp[0]}")
                 break
         if target_dict is None: target_dict = dec
 
@@ -1597,15 +1653,37 @@ async def _handle_team_invite(hex_data, pl, uid_str, current_account_data,
                     break
 
         own_acc = str(current_account_data.get('account_id')) if current_account_data else None
-        inviter = None
+        # The inviter is one of our own squad accounts. A bare "first number" can be a Unix
+        # timestamp (e.g. 1792356108), which made the accept request point at a non-existent
+        # player. So: prefer ids of known peers, and never pick a number that looks like "now".
+        peer_ids = set()
+        try:
+            for pu, info in list(_team_state["peers"].items()):
+                peer_ids.add(str(pu))
+                try: peer_ids.add(str(info["data"].get("account_id")))
+                except Exception: pass
+        except Exception: pass
+        now_ts = time.time()
+        def _looks_like_timestamp(sv):
+            try:
+                iv = int(sv)
+                return abs(iv - now_ts) < 172800 or abs(iv - now_ts * 1000) < 172800000
+            except Exception: return False
+        inviter = None; inviter_k = None; fallback = None
         all_f = list(target_dict.keys()) + list(dec.keys())
         for k in all_f:
             c = _g(target_dict, k) or _g(dec, k)
             if c and str(c).isdigit() and 6 <= len(str(c)) <= 15:
-                if str(c) != uid_str and str(c) != own_acc:
-                    inviter = str(c)
-                    print_success(f"[TEAM-IN {uid_str}] 👤 inviter@f{k}: {c}")
-                    break
+                sc = str(c)
+                if sc == uid_str or sc == own_acc: continue
+                if sc in peer_ids:
+                    inviter, inviter_k = sc, k; break
+                if fallback is None and not _looks_like_timestamp(sc):
+                    fallback = (sc, k)
+        if inviter is None and fallback:
+            inviter, inviter_k = fallback
+        if inviter:
+            print_success(f"[TEAM-IN {uid_str}] 👤 inviter@f{inviter_k}: {inviter}")
 
         tc = None
         for k in all_f:
@@ -1674,88 +1752,102 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
         except Exception: pass
 
     # ═══════════ LEADER: create → invite-loop → ready → start ═══════════
-    async def _team_coordinator():
-        try:
-            deadline = time.time() + TEAM_PEER_WAIT_TIMEOUT
-            while time.time() < deadline:
-                async with _team_state["lock"]:
-                    n = len(_team_state["peers"])
-                if n >= TEAM_SIZE: break
-                if bot_state.is_paused(uid_str): return
-                await asyncio.sleep(0.5)
+    # The coordinator now runs in ROUNDS: if a squad can't be completed, or the leader is gone,
+    # it simply tries again (and a member can take over leadership) instead of idling until the
+    # watchdog kills the connection.
+    def _peer_ids_snapshot():
+        out = []
+        for peer_uid, info in dict(_team_state["peers"]).items():
+            if peer_uid == uid_str: continue
+            pa = None
+            try: pa = info["data"].get("account_id")
+            except Exception: pass
+            if not pa: pa = peer_uid
+            try: out.append(int(pa))
+            except Exception: pass
+        return out
 
+    async def _team_coordinator_round():
+        """One formation attempt. Returns 'retry' for another round, 'done' to stop."""
+        async with _team_state["lock"]:
+            if _team_state["leader_uid"] is None:
+                _team_state["leader_uid"] = uid_str
+                print_success(f"[TEAM] 👑 {uid_str} took over as leader")
+            is_leader = (_team_state["leader_uid"] == uid_str)
+        if not is_leader:
+            await asyncio.sleep(LEADER_RECHECK_INTERVAL)
+            return "retry"
+
+        deadline = time.time() + TEAM_PEER_WAIT_TIMEOUT
+        while time.time() < deadline:
             async with _team_state["lock"]:
                 n = len(_team_state["peers"])
-                is_leader = (_team_state["leader_uid"] == uid_str)
-                peers_snapshot = dict(_team_state["peers"])
+                still_leader = (_team_state["leader_uid"] == uid_str)
+            if not still_leader: return "retry"
+            if n >= TEAM_SIZE: break
+            if bot_state.is_paused(uid_str): return "done"
+            await asyncio.sleep(0.5)
 
-            if not is_leader:
-                print_info(f"[TEAM] {uid_str} waiting as member...")
-                return
-            if n < TEAM_SIZE:
-                print_warning(f"[TEAM] Only {n}/{TEAM_SIZE} peers")
-            else:
-                print_success(f"[TEAM] ✅ All {n} peers online")
+        async with _team_state["lock"]:
+            n = len(_team_state["peers"])
+        if n < TEAM_SIZE:
+            print_warning(f"[TEAM] Only {n}/{TEAM_SIZE} peers")
+        else:
+            print_success(f"[TEAM] ✅ All {n} peers online")
 
-            await asyncio.sleep(TEAM_READY_DELAY)
-            print_success(f"[TEAM] 👑 {uid_str} creating team...")
+        await asyncio.sleep(TEAM_READY_DELAY)
+        print_success(f"[TEAM] 👑 {uid_str} creating team...")
 
-            async with _team_state["lock"]:
-                _team_state["team_code"] = None
-                _team_state["pk_code"] = None
+        async with _team_state["lock"]:
+            _team_state["team_code"] = None
+            _team_state["pk_code"] = None
 
-            own_id_num = None
-            if current_account_data: own_id_num = current_account_data.get('account_id')
-            if not own_id_num:
-                try: own_id_num = int(uid_str)
-                except Exception: own_id_num = 0
+        own_id_num = None
+        if current_account_data: own_id_num = current_account_data.get('account_id')
+        if not own_id_num:
+            try: own_id_num = int(uid_str)
+            except Exception: own_id_num = 0
 
-            try:
-                pkt = create_team(current_key, current_iv, client_version)
-                if _writer_ref["w"] and not _writer_ref["w"].is_closing():
-                    _writer_ref["w"].write(pkt); await _writer_ref["w"].drain()
-                    print_info(f"[TEAM] create_team sent ({len(pkt)}B)")
-                    await _team_member_reset(keep_leader=False)
-                    await _team_member_join(uid_str)
-            except Exception as e:
-                print_error(f"[TEAM] create_team: {e}")
+        try:
+            pkt = create_team(current_key, current_iv, client_version)
+            if _writer_ref["w"] and not _writer_ref["w"].is_closing():
+                _writer_ref["w"].write(pkt); await _writer_ref["w"].drain()
+                print_info(f"[TEAM] create_team sent ({len(pkt)}B)")
+                await _team_member_reset(keep_leader=False)
+                await _team_member_join(uid_str)
+        except Exception as e:
+            print_error(f"[TEAM] create_team: {e}")
 
-            await asyncio.sleep(TEAM_CREATE_WAIT)
+        await asyncio.sleep(TEAM_CREATE_WAIT)
 
-            peer_uids = []
-            for peer_uid, info in peers_snapshot.items():
-                if peer_uid == uid_str: continue
-                pa = None
-                try: pa = info["data"].get("account_id")
+        heartbeat_stop = asyncio.Event()
+        async def heartbeat_loop():
+            while not heartbeat_stop.is_set():
+                try:
+                    if _writer_ref["w"] and not _writer_ref["w"].is_closing():
+                        pkt = team_fresh(int(own_id_num), current_key, current_iv)
+                        _writer_ref["w"].write(pkt); await _writer_ref["w"].drain()
                 except Exception: pass
-                if not pa: pa = peer_uid
-                peer_uids.append(int(pa))
-            print_info(f"[TEAM] Will invite {len(peer_uids)} peers: {peer_uids}")
+                try: await asyncio.wait_for(heartbeat_stop.wait(), timeout=TEAM_HEARTBEAT_INTERVAL)
+                except asyncio.TimeoutError: pass
+        hb_task = asyncio.create_task(heartbeat_loop())
 
-            heartbeat_stop = asyncio.Event()
-            async def heartbeat_loop():
-                while not heartbeat_stop.is_set():
-                    try:
-                        if _writer_ref["w"] and not _writer_ref["w"].is_closing():
-                            pkt = team_fresh(int(own_id_num), current_key, current_iv)
-                            _writer_ref["w"].write(pkt); await _writer_ref["w"].drain()
-                    except Exception: pass
-                    try: await asyncio.wait_for(heartbeat_stop.wait(), timeout=TEAM_HEARTBEAT_INTERVAL)
-                    except asyncio.TimeoutError: pass
-            hb_task = asyncio.create_task(heartbeat_loop())
-
+        try:
             print_success(f"[TEAM] 🎯 Invite-loop start (max {int(TEAM_INVITE_MAX_TIME)}s)")
             invite_start = time.time()
             cycle = 0
             while time.time() - invite_start < TEAM_INVITE_MAX_TIME:
                 if not _team_active["flag"]: break
                 if bot_state.is_paused(uid_str): break
+                async with _team_state["lock"]:
+                    if _team_state["leader_uid"] != uid_str: break
                 cnt = await _team_member_count()
                 if cnt >= TEAM_SIZE:
                     print_success(f"[TEAM] 🎉 Full team ({cnt}/{TEAM_SIZE})!")
                     break
                 cycle += 1
-                for i, tuid in enumerate(peer_uids):
+                # re-read the peers every cycle so an account that reconnected meanwhile is invited too
+                for tuid in _peer_ids_snapshot():
                     async with _team_state["members_lock"]:
                         joined = str(tuid) in _team_state["members"]
                     if joined: continue
@@ -1774,50 +1866,68 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
             print_colored(f"[TEAM] ══ FINAL: In team ({final_cnt}/{TEAM_SIZE}) ══", Colors.MAGENTA)
 
             if final_cnt < TEAM_SIZE:
-                print_error(f"[TEAM] Only {final_cnt}/{TEAM_SIZE} joined — abort, retry")
-                heartbeat_stop.set()
-                await cancel_and_wait(hb_task)
-                return
+                print_error(f"[TEAM] Only {final_cnt}/{TEAM_SIZE} joined — abort, retry round")
+                return "retry"
 
+            _mark_progress()          # a full squad = real progress
             await asyncio.sleep(TEAM_FINAL_WAIT)
+        finally:
             heartbeat_stop.set()
             await cancel_and_wait(hb_task)
 
-            print_success(f"[TEAM] 🚀 {uid_str} loop: ready → 1s → start (every 5s)")
-            while _team_active["flag"]:
+        print_success(f"[TEAM] 🚀 {uid_str} loop: ready → 1s → start (every 5s)")
+        while _team_active["flag"]:
+            try:
+                if bot_state.is_paused(uid_str): break
+                async with _team_state["lock"]:
+                    if _team_state["leader_uid"] != uid_str: break
+                oid = current_account_data.get('account_id', own_id_num) if current_account_data else own_id_num
                 try:
-                    if bot_state.is_paused(uid_str): break
-                    async with _team_state["lock"]:
-                        if _team_state["leader_uid"] != uid_str: break
-                    oid = current_account_data.get('account_id', own_id_num) if current_account_data else own_id_num
-                    try:
-                        rdy = ready_for_game(int(oid), current_key, current_iv)
-                        if _writer_ref["w"] and not _writer_ref["w"].is_closing():
-                            _writer_ref["w"].write(rdy); await _writer_ref["w"].drain()
-                    except Exception as e: print_warning(f"[TEAM] ready err: {e}")
-                    await asyncio.sleep(1.0)
-                    sm = start_match_team(int(oid), current_key, current_iv, region=account_region)
+                    rdy = ready_for_game(int(oid), current_key, current_iv)
                     if _writer_ref["w"] and not _writer_ref["w"].is_closing():
-                        _writer_ref["w"].write(sm); await _writer_ref["w"].drain()
-                        search_attempts_ref["n"] += 1
-                except Exception as e: print_warning(f"[TEAM] start err: {e}")
-                try: await asyncio.wait_for(asyncio.sleep(5.0), timeout=5.5)
-                except asyncio.TimeoutError: pass
+                        _writer_ref["w"].write(rdy); await _writer_ref["w"].drain()
+                except Exception as e: print_warning(f"[TEAM] ready err: {e}")
+                await asyncio.sleep(1.0)
+                sm = start_match_team(int(oid), current_key, current_iv, region=account_region)
+                if _writer_ref["w"] and not _writer_ref["w"].is_closing():
+                    _writer_ref["w"].write(sm); await _writer_ref["w"].drain()
+                    search_attempts_ref["n"] += 1
+            except Exception as e: print_warning(f"[TEAM] start err: {e}")
+            try: await asyncio.wait_for(asyncio.sleep(5.0), timeout=5.5)
+            except asyncio.TimeoutError: pass
+        return "done" if (bot_state.is_paused(uid_str) or not _team_active["flag"]) else "retry"
+
+    async def _team_coordinator():
+        try:
+            while _team_active["flag"]:
+                if bot_state.is_paused(uid_str): return
+                try:
+                    res = await _team_coordinator_round()
+                except asyncio.CancelledError: raise
+                except Exception as e:
+                    print_error(f"[TEAM] coordinator: {e}")
+                    traceback.print_exc()
+                    res = "retry"
+                if res == "done": return
+                await asyncio.sleep(TEAM_RETRY_DELAY)
         except asyncio.CancelledError: raise
-        except Exception as e:
-            print_error(f"[TEAM] coordinator: {e}")
-            traceback.print_exc()
 
     async def _member_match_trigger():
         try:
             await asyncio.sleep(TEAM_READY_DELAY + TEAM_MEMBER_START_DELAY)
-            async with _team_state["lock"]:
-                if _team_state["leader_uid"] == uid_str: return
-            print_success(f"[TEAM] 🚀 Member {uid_str}: ready → 1s → start (every 5s)")
             my_id = current_account_data.get('account_id', uid_str) if current_account_data else uid_str
+            announced = False
             while _team_active["flag"]:
                 try:
                     if bot_state.is_paused(uid_str): break
+                    # leadership can change at any time now -> re-check every iteration
+                    async with _team_state["lock"]:
+                        am_leader = (_team_state["leader_uid"] == uid_str)
+                    if am_leader:
+                        await asyncio.sleep(LEADER_RECHECK_INTERVAL); continue
+                    if not announced:
+                        print_success(f"[TEAM] 🚀 Member {uid_str}: ready → 1s → start (every 5s)")
+                        announced = True
                     if _writer_ref["w"] and not _writer_ref["w"].is_closing():
                         try:
                             rdy = ready_for_game(int(my_id), current_key, current_iv)
@@ -1838,6 +1948,12 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
             writer = None; gateway_ping_task = None
             team_coord_task = None; member_trigger_task = None
             try:
+                # Stop Bot used to leave the socket open and silently kill the squad loops.
+                # Now a paused account stays disconnected until it is resumed, then every
+                # account reconnects together.
+                while bot_state.is_paused(uid_str):
+                    await asyncio.sleep(1.0)
+
                 if current_account_data:
                     fresh = None
                     if current_account_data.get('auth_type') == 'guest' and current_account_data.get('auth_uid'):
@@ -1894,6 +2010,8 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                 rip = await resolve_host_cloudflare(ip)
                 reader, writer = await asyncio.open_connection(rip, int(port))
                 _writer_ref["w"] = writer
+                try: bot_state.register_writer(uid_str, writer)
+                except Exception: pass
                 raw_sock = writer.get_extra_info('socket')
                 if raw_sock: optimize_tcp_socket(raw_sock)
                 await asyncio.sleep(bypass_hello_delay())
@@ -1954,8 +2072,10 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                     if now - last_watchdog_check >= MATCH_WATCHDOG_CHECK:
                         last_watchdog_check = now
                         sd = now - connection_start_time
+                        # progress-aware: never cut a connection while the squad is moving forward
+                        sd_eff = min(sd, time.time() - _team_state["last_progress"])
                         if sd > 30: print_warning(f"[WATCHDOG] {uid_str} searching {int(sd)}s att={search_attempts_ref['n']}")
-                        if sd > SEARCH_TIMEOUT_EFFECTIVE:
+                        if sd_eff > SEARCH_TIMEOUT_EFFECTIVE:
                             raise ConnectionError("Search watchdog")
                     if search_attempts_ref["n"] >= MAX_SEARCH_ATTEMPTS:
                         raise ConnectionError("Max attempts")
@@ -2003,6 +2123,7 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                                 except asyncio.CancelledError: pass
                         team_coord_task = None; member_trigger_task = None
                         _team_active["flag"] = False
+                        _mark_progress()
 
                         try:
                             res = json.loads(await decode_protobuf(hex_data[10:]))
@@ -2072,6 +2193,7 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                                     try: await drain_task
                                     except asyncio.CancelledError: pass
                                 play_matches[:] = [m for m in play_matches if not m.done()]
+                                _mark_progress()
 
                                 async with _team_state["lock"]:
                                     _team_state["peers"].pop(uid_str, None)
@@ -2145,6 +2267,8 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                         except (asyncio.CancelledError, Exception): pass
                 if gateway_ping_task: gateway_ping_task.cancel()
                 if writer:
+                    try: bot_state.unregister_writer(uid_str, writer)
+                    except Exception: pass
                     try: writer.close(); await writer.wait_closed()
                     except Exception: pass
                 async with _team_state["lock"]:
@@ -2522,7 +2646,22 @@ async def main():
     async def on_refresh_account(uid):
         await refresh_account_profile(uid)
 
+    async def on_pause_toggle(uid, paused):
+        # Pausing closes the sockets (see BotState.toggle_pause); on resume make sure the squad
+        # state is clean so everybody re-forms together.
+        if not paused:
+            await _force_team_resync("resume")
+
+    async def on_restart_account(uid):
+        # "Restart Bot" must really resume + resync (it used to only refresh a profile).
+        for k in list(bot_state.accounts.keys()):
+            if bot_state.is_paused(k):
+                bot_state.toggle_pause(k)
+        await _force_team_resync("manual restart")
+
     try:
+        bot_state.refresh_callbacks["on_pause_toggle"] = on_pause_toggle
+        bot_state.refresh_callbacks["on_restart_account"] = on_restart_account
         bot_state.refresh_callbacks["on_account_added"] = on_account_added
         bot_state.refresh_callbacks["on_refresh_account"] = on_refresh_account
         bot_state.refresh_callbacks["relogin_account"] = relogin_account_creds
@@ -2539,6 +2678,9 @@ async def main():
             u = str(acc["uid"])
             t = asyncio.create_task(account_loop_guest(u, acc["password"]))
             bot_state.account_workers[u] = t
+
+    supervisor_task = asyncio.create_task(team_resync_supervisor())
+    bot_state.account_workers["__resync_supervisor__"] = supervisor_task
 
     try:
         while True: await asyncio.sleep(1)
