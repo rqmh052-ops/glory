@@ -631,6 +631,16 @@
                     statusEl.textContent = (stats.total_accounts || 0) === 0
                         ? 'NO ACCOUNTS'
                         : (accs.length > 0 && accs.every(a => a.is_paused) ? 'PAUSED' : 'RUNNING');
+
+                    // keep the Stop/Restart button in sync with the SERVER state (it used to
+                    // reset to "Stop Bot" on every page reload even while the bot was paused)
+                    const allPausedNow = accs.length > 0 && accs.every(a => a.is_paused);
+                    isAllPaused = allPausedNow;
+                    const pbtn = document.getElementById('pause-toggle-btn');
+                    if (pbtn) {
+                        if (allPausedNow) { pbtn.textContent = 'Restart Bot'; pbtn.classList.remove('stop-active'); }
+                        else { pbtn.textContent = 'Stop Bot'; pbtn.classList.add('stop-active'); }
+                    }
                 }
 
                 const uptimeSec = stats.uptime || 0;
@@ -721,7 +731,7 @@
 
         async function togglePauseAll() {
             const btn = document.getElementById('pause-toggle-btn');
-            const endpoint = isAllPaused ? '/api/account/restart' : '/api/account/pause_all';
+            const endpoint = '/api/account/pause_all';   // same toggle for Stop and Restart
             
             try {
                 const res = await fetch(endpoint, {
