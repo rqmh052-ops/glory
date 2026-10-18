@@ -37,6 +37,8 @@ START_MATCH_INTERVAL    = 4.0
 NEW_MATCH_DELAY         = 6.0
 MAX_MATCH_DURATION      = 3000
 MATCH_IDLE_TIMEOUT      = 90.0
+HELLO_RESEND_SECS       = 3.0     # UDP hello is re-sent this often until the server answers (was 7s)
+HANDSHAKE_TIMEOUT       = 40.0    # give up if the startup packets still weren't sent after this long (was 25s)
 EXP_REFRESH_INTERVAL    = 30.0
 EXP_REFRESH_AFTER_MATCH_DELAY = 9.0
 MAX_CONSECUTIVE_PARSE_FAILURES = 5
@@ -273,6 +275,11 @@ def print_info(t):
     try: bot_state.log(t, "info")
     except Exception: pass
 
+def log_reply(src, uid, raw, note="", text=False):
+    """Store one server reply verbatim in the dashboard log (never raises)."""
+    try: bot_state.log_reply(src, uid, raw, note, text)
+    except Exception: pass
+
 def get_proto_field(d, key, default=None):
     if not d or not isinstance(d, dict): return default
     if key in d:
@@ -504,7 +511,9 @@ async def version_config():
            f"?version={app_version}&lang=hi&device=android&channel=android"
            "&appstore=googleplay&region=ID&whitelist_version=1.3.0&whitelist_sp_version=1.0.0")
     try:
-        r = await client.get(url); r.raise_for_status()
+        r = await client.get(url)
+        log_reply("HTTP", "-", r.text, f"VersionConfig status={r.status_code}", text=True)
+        r.raise_for_status()
         d = r.json()
         su = d.get("server_url"); rv = d.get("remote_version"); lr = d.get("latest_release_version")
         if not su or not rv or not lr: return None
@@ -527,6 +536,7 @@ async def get_access_token(uid, password):
     for attempt in range(5):
         try:
             r = await client.post(url, headers=hdrs, data=data)
+            log_reply("HTTP", uid, r.text, f"OAuth status={r.status_code}", text=True)
             if r.status_code == 200:
                 d = r.json()
                 oid = d.get("open_id"); at = d.get("access_token"); pf = d.get("platform", 4)
@@ -768,6 +778,7 @@ async def send_majorlogin(data, release_version, server_url):
         url = f"{server_url}MajorLogin" if server_url.endswith('/') else f"{server_url}/MajorLogin"
         hdrs = headers.copy(); hdrs["ReleaseVersion"] = str(release_version)
         r = await client.post(url, headers=hdrs, data=data)
+        log_reply("HTTP", "-", r.content, f"MajorLogin status={r.status_code}")
         if r.status_code != 200:
             print_error(f"[MAJORLOGIN] HTTP {r.status_code}"); return None
         c = r.content
@@ -792,6 +803,7 @@ async def send_getlogin(data, base_url, token, release_version):
         hdrs['Authorization'] = f"Bearer {token}"
         hdrs['Host'] = "clientbp.ppmainecoonghj.com"
         r = await client.post(url, headers=hdrs, data=data)
+        log_reply("HTTP", "-", r.content, f"GetLoginData status={r.status_code}")
         if r.status_code != 200: return None
         c = r.content
         rp = thunderFF_pb2.GetLoginDataRes()
@@ -835,6 +847,7 @@ async def send_ping(account_id, token, release_version):
             'x-unity-version': '2018.4.12f1',
         }
         r = await client.post(PING_URL, headers=hdrs, content=payload, timeout=PING_TIMEOUT)
+        log_reply("HTTP", str(account_id), r.content, f"Ping status={r.status_code}")
         return r.status_code == 200
     except Exception: return False
 
@@ -1384,6 +1397,7 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
         send_lock = asyncio.Lock(); anti_started = False
         ping_task = asyncio.create_task(keepalive_ping(sock, rip, port, udp_key_bytes, match_code, ping_stop))
         last_activity = time.time()
+        last_cmd = None; _last_err_log = 0.0
         print_colored(f"[MATCH #{match_index}] UDP -> {server_ip_port} (DNS:{rip})", Colors.MAGENTA)
 
         async def start_workers():
@@ -1419,15 +1433,34 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
 
         while not local_closed:
             if time.time() - t0 > MAX_MATCH_DURATION: break
+            # evaluated on every pass: the old check lived only in the "1.5s of silence" branch and
+            # had no case at all for the ack_sent_waiting state, so a stuck handshake could hold the
+            # account for up to MAX_MATCH_DURATION without ever sending the startup packets
+            if not thunder_sent and (time.time() - t0) > HANDSHAKE_TIMEOUT:
+                print_warning(f"[MATCH #{match_index}] Handshake timeout after {int(time.time()-t0)}s "
+                              f"(state={ack_state}, startup packets never sent)")
+                break
             try:
                 resp, saddr = await asyncio.wait_for(loop.sock_recvfrom(sock, 65535), timeout=1.5)
                 if resp:
                     last_activity = time.time()
                     frame = await decode_packet(resp, udp_key_bytes, match_code)
+                    try:
+                        _el = int(time.time() - t0)
+                        if frame:
+                            _body = frame.get("content") or b""
+                            _note = (f"#{match_index} +{_el}s {saddr[0]}:{saddr[1]} cmd={frame['cmd']} "
+                                     f"flags={frame['flags']} body={len(_body)}B"
+                                     + (f":{bytes(_body[:256]).hex()}{'...' if len(_body) > 256 else ''}" if _body else ""))
+                        else:
+                            _note = f"#{match_index} +{_el}s {saddr[0]}:{saddr[1]} (undecoded)"
+                    except Exception: _note = f"#{match_index}"
+                    log_reply("UDP", uid_str, resp, _note)
                     if frame:
+                        last_cmd = frame['cmd']
                         pt = await classify(frame)
                         if frame['cmd'] in [103, 107]:
-                            print_success(f"[MATCH #{match_index}] END cmd={frame['cmd']}")
+                            print_success(f"[MATCH #{match_index}] END cmd={frame['cmd']} (in match {int(time.time()-t0)}s)")
                             completed = True; local_closed = True; continue
                         if frame['cmd'] == 101:
                             try:
@@ -1461,22 +1494,30 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                 if ack_state == "ready_to_send_thunder" and not thunder_sent:
                     await send_startup()
                 elif ack_state == "waiting_for_hello_reply":
-                    if (time.time() - last_activity) > 7.0:
+                    if (time.time() - last_activity) > HELLO_RESEND_SECS:
                         try:
                             hp = await build_hello_packet(f"{account_id}_2585", udp_key_bytes, match_code)
                             await loop.sock_sendto(sock, bytes.fromhex(hp), (rip, port))
                         except Exception: pass
                         last_activity = time.time()
-                    if (time.time() - t0) > 25.0:
-                        print_warning(f"[MATCH #{match_index}] Handshake timeout"); break
                 elif ack_state == "thunder_sharma_sent":
                     if (time.time() - last_activity) > MATCH_IDLE_TIMEOUT:
-                        print_success(f"[MATCH #{match_index}] Finished naturally")
+                        print_success(f"[MATCH #{match_index}] Finished naturally (no server packet for "
+                                      f"{int(MATCH_IDLE_TIMEOUT)}s, NO END cmd; last cmd={last_cmd}; "
+                                      f"in match {int(time.time()-t0)}s)")
                         completed = True; break
                 continue
             except BlockingIOError: await asyncio.sleep(0.05)
-            except OSError: await asyncio.sleep(0.5); continue
-            except Exception: await asyncio.sleep(0.5); continue
+            except OSError as _oe:
+                if time.time() - _last_err_log > 5.0:
+                    _last_err_log = time.time()
+                    print_warning(f"[MATCH #{match_index}] UDP socket error: {_oe!r}")
+                await asyncio.sleep(0.5); continue
+            except Exception as _ee:
+                if time.time() - _last_err_log > 5.0:
+                    _last_err_log = time.time()
+                    print_warning(f"[MATCH #{match_index}] UDP loop error: {_ee!r}")
+                await asyncio.sleep(0.5); continue
             if ack_state == "ready_to_send_thunder" and not thunder_sent:
                 await start_startup_safe(send_startup)
         return f"match #{match_index} finished"
@@ -1505,7 +1546,7 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
             except Exception: pass
         rem = await _dec_match(uid_str)
         total = await _get_total_match_count()
-        print_info(f"[MATCH #{match_index}] Closed. UID:{rem} Total:{total}")
+        print_info(f"[MATCH #{match_index}] Closed. UID:{rem} Total:{total} | completed={completed} after {int(time.time()-t0)}s")
         try: bot_state.update_status(uid_str, "IN_MATCH" if rem > 0 else "ONLINE", rem)
         except Exception: pass
 
@@ -2091,7 +2132,8 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                             if no_response_count > 80: raise ConnectionError("idle")
                         continue
 
-                    if not data: raise ConnectionError("closed")
+                    if not data: raise ConnectionError("closed by server (EOF)")
+                    log_reply("TCP", uid_str, data)
                     hex_data = data.hex()
                     pl = len(data)
                     no_response_count = 0
@@ -2179,12 +2221,17 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                                     while not new_match.done():
                                         try:
                                             dg = await asyncio.wait_for(reader.read(4096), timeout=1.0)
-                                            if not dg: break
+                                            if not dg:
+                                                print_warning(f"[DRAIN] {uid_str} gateway TCP closed by server while in match")
+                                                break
+                                            log_reply("TCP", uid_str, dg, "in-match")
                                             gh = dg.hex()
                                             if gh.startswith("0600") and len(dg) > 20:
                                                 await _process_social_packet(dg, current_account_data, tag="DRAIN")
                                         except asyncio.TimeoutError: continue
-                                        except Exception: break
+                                        except Exception as _de:
+                                            print_warning(f"[DRAIN] {uid_str} gateway read error in match: {_de!r}")
+                                            break
                                 drain_task = asyncio.create_task(drain_gw())
                                 try: await new_match
                                 except Exception as e: print_error(f"[MATCH #{match_index}] {e}")
@@ -2285,7 +2332,7 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
         raise
 
 # ═══════════════════════════ INFORMATIONAL ═══════════════════════════
-async def informational(addrs, starter_packet, key, iv, region="ID", max_reconnects=3, starter_getter=None):
+async def informational(addrs, starter_packet, key, iv, region="ID", max_reconnects=3, starter_getter=None, uid_tag=""):
     reconnects = 0
     ip, port = addrs.split(":")
     while True:
@@ -2318,6 +2365,7 @@ async def informational(addrs, starter_packet, key, iv, region="ID", max_reconne
             while True:
                 data = await reader.read(8192)
                 if not data: raise ConnectionError("closed")
+                log_reply("TCP-CHAT", uid_tag, data)
         except asyncio.CancelledError:
             if ping_task: ping_task.cancel()
             if writer:
@@ -2535,7 +2583,7 @@ async def run_account_worker(ad, label):
                 cur['aes_ak'], cur['iv_i'], region=cur.get('region', reg), typ='ChaT')
         info_task = asyncio.create_task(informational(ad['informational_addrs'], tcp_chat,
                                                       ad['aes_ak'], ad['iv_i'], region=reg,
-                                                      starter_getter=_fresh_chat_starter))
+                                                      starter_getter=_fresh_chat_starter, uid_tag=acc_id))
         if ENABLE_HTTP_PING:
             ping_task = asyncio.create_task(ping_worker(acc_id, ad['token'], ad['release_version'], region=reg))
             print_success(f"[PING] Started {acc_id}")

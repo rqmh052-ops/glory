@@ -6,6 +6,7 @@ Optimized for ultra-smooth operation, zero memory leaks, and dynamic multi-accou
 """
 
 import asyncio
+import collections
 import json
 import os
 import time
@@ -232,7 +233,6 @@ async def handle_get_stats(request: web.Request) -> web.Response:
         "total_gained_exp": total_gained,
         "exp_per_hour": exp_per_hour,
         "accounts": accounts_data,
-        "logs": bot_state.logs[-80:],
         "uptime": uptime_sec
     })
 
@@ -257,11 +257,108 @@ def calculate_level_progress(level: int, current_exp: int) -> Dict[str, Any]:
         "progress_pct": round(progress_pct, 1)
     }
 
+# ==================== LOG STORE ====================
+def _env_int(name, default):
+    try:
+        return max(1, int(os.environ.get(name, default)))
+    except Exception:
+        return default
+
+
+class LogStore:
+    """Dashboard log buffers.
+
+    Three separate rings (events + TCP replies / UDP replies / HTTP replies) so a flood of UDP
+    packets during a match can never push the events and TCP replies out of the buffer. All
+    entries share one global id, so they are merged back into one time-ordered view.
+    Limits (override with env vars): LOG_MAX_LINES / LOG_MAX_MB (events + TCP),
+    LOG_MAX_UDP_LINES / LOG_MAX_UDP_MB, LOG_MAX_HTTP_LINES / LOG_MAX_HTTP_MB.
+    """
+    RING_OF = {"ev": "main", "tcp": "main", "udp": "udp", "http": "http"}
+    ENTRY_OVERHEAD = 96
+
+    def __init__(self):
+        self.limits = {
+            "main": (_env_int("LOG_MAX_LINES", 20000), _env_int("LOG_MAX_MB", 30) * 1048576),
+            "udp":  (_env_int("LOG_MAX_UDP_LINES", 20000), _env_int("LOG_MAX_UDP_MB", 40) * 1048576),
+            "http": (_env_int("LOG_MAX_HTTP_LINES", 3000), _env_int("LOG_MAX_HTTP_MB", 10) * 1048576),
+        }
+        self.rings = {k: collections.deque() for k in self.limits}
+        self.sizes = {k: 0 for k in self.limits}
+        self.next_id = 1
+        self.epoch = 1
+
+    def add(self, kind, level, uid, message):
+        ts = time.time()
+        entry = {
+            "i": self.next_id,
+            "t": time.strftime("%H:%M:%S", time.localtime(ts)) + ".%03d" % int((ts % 1) * 1000),
+            "l": level, "k": kind, "u": uid or "", "m": message,
+        }
+        self.next_id += 1
+        ring = self.RING_OF.get(kind, "main")
+        dq = self.rings[ring]
+        dq.append(entry)
+        self.sizes[ring] += len(message) + self.ENTRY_OVERHEAD
+        max_lines, max_bytes = self.limits[ring]
+        while dq and (len(dq) > max_lines or self.sizes[ring] > max_bytes):
+            old = dq.popleft()
+            self.sizes[ring] -= len(old["m"]) + self.ENTRY_OVERHEAD
+        return entry
+
+    def query(self, since=0, kinds=None, limit=0):
+        kinds = set(kinds) if kinds else set(self.RING_OF)
+        rings = {self.RING_OF[k] for k in kinds if k in self.RING_OF}
+        out = []
+        for r in rings:
+            part = []
+            for e in reversed(self.rings[r]):
+                if e["i"] <= since:
+                    break
+                if e["k"] in kinds:
+                    part.append(e)
+                    if limit and len(part) >= limit:
+                        break
+            out.extend(part)
+        out.sort(key=lambda e: e["i"])
+        if limit and len(out) > limit:
+            out = out[-limit:]
+        return out
+
+    def get(self, entry_id):
+        for dq in self.rings.values():
+            for e in reversed(dq):
+                if e["i"] == entry_id:
+                    return e
+                if e["i"] < entry_id:
+                    break
+        return None
+
+    def clear(self):
+        for k in self.rings:
+            self.rings[k].clear()
+            self.sizes[k] = 0
+        self.epoch += 1
+
+    def counts(self):
+        return {k: len(v) for k, v in self.rings.items()}
+
+    @property
+    def last_id(self):
+        return self.next_id - 1
+
+
+def format_log_line(e):
+    """Plain-text form of one entry (used by copy / download)."""
+    u = f"[{e['u']}] " if e.get("u") else ""
+    lvl = {"error": "ERROR ", "warning": "WARN "}.get(e.get("l"), "")
+    return f"[{e['t']}] {u}{lvl}{e['m']}"
+
+
 class BotState:
     def __init__(self):
         self.accounts: Dict[str, Dict[str, Any]] = {}
-        self.logs: List[Dict[str, Any]] = []
-        self.max_logs = 200
+        self.logstore = LogStore()
         self.total_matches = 0
         self.total_matches_started = 0      # 🔥 NEW
         self.total_gained_exp = 0
@@ -329,15 +426,19 @@ class BotState:
             self.active_writers.pop(c, None)
 
     def log(self, message: str, level: str = "info", uid: Optional[str] = None):
-        entry = {
-            "time": time.strftime("%H:%M:%S"),
-            "level": level,
-            "message": message,
-            "uid": str(uid) if uid else None
-        }
-        self.logs.append(entry)
-        if len(self.logs) > self.max_logs:
-            self.logs.pop(0)
+        self.logstore.add("ev", level, str(uid) if uid else "", message)
+
+    def log_reply(self, src: str, uid: Optional[str], raw, note: str = "", text: bool = False):
+        """Store one server reply verbatim. Binary replies are stored as full hex, text replies
+        (JSON etc.) as the exact text. src is TCP / TCP-CHAT / UDP / HTTP."""
+        s_up = str(src).upper()
+        kind = "udp" if s_up.startswith("UDP") else ("http" if s_up.startswith("HTTP") else "tcp")
+        if text:
+            body = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
+        else:
+            body = bytes(raw).hex()
+        msg = f"{src}< {len(raw)}B" + (f" {note}" if note else "") + f" {body}"
+        self.logstore.add(kind, "reply", str(uid) if uid else "", msg)
 
     def register_account(self, uid: str, nickname: str, region: str, level: int, exp: int,
                          likes: int = 0, token: Optional[str] = None, auth_uid: Optional[str] = None):
@@ -987,7 +1088,7 @@ async def handle_restart_account(request: web.Request) -> web.Response:
 
 
 async def handle_clear_logs(request: web.Request) -> web.Response:
-    bot_state.logs.clear()
+    bot_state.logstore.clear()
     return web.json_response({"status": "ok"})
 
 
@@ -1010,18 +1111,64 @@ async def handle_toggle_pause_all(request: web.Request) -> web.Response:
     except Exception as e:
         return web.json_response({"status": "error", "error": str(e)})
 
+_LOG_FILTERS = {
+    "all": {"ev", "tcp", "udp", "http"},
+    "events": {"ev"},
+    "replies": {"tcp", "udp", "http"},
+    "tcp": {"tcp"},
+    "udp": {"udp"},
+    "http": {"http"},
+}
+
+
+def _qint(v, default=0):
+    try:
+        return max(0, int(v))
+    except Exception:
+        return default
+
+
+def _log_filter(request: web.Request):
+    return _LOG_FILTERS.get(str(request.query.get("f", "all")).lower(), _LOG_FILTERS["all"])
+
+
 async def handle_api_logs(request: web.Request) -> web.Response:
-    formatted_logs = []
-    for entry in bot_state.logs[-80:]:
-        if isinstance(entry, dict):
-            t = entry.get("time", "")
-            msg = entry.get("message", "")
-            level = entry.get("level", "info")
-            color = "#34d399" if level == "success" else ("#f87171" if level == "warning" or level == "error" else "#38bdf8")
-            formatted_logs.append(f'<span style="color:{color}">[{t}] {msg}</span>')
-        else:
-            formatted_logs.append(str(entry))
-    return web.json_response({"logs": formatted_logs}, status=200)
+    """Incremental log feed: ?since=<last id>&limit=<last N>&f=<filter>&trunc=<max chars/line>."""
+    store = bot_state.logstore
+    since = _qint(request.query.get("since"))
+    limit = _qint(request.query.get("limit"))
+    trunc = _qint(request.query.get("trunc"))
+    rows = []
+    for e in store.query(since, _log_filter(request), limit):
+        m = e["m"]
+        cut = 0
+        if trunc and len(m) > trunc:
+            cut = len(m) - trunc
+            m = m[:trunc]
+        rows.append({"i": e["i"], "t": e["t"], "l": e["l"], "k": e["k"], "u": e["u"], "m": m, "x": cut})
+    return web.json_response({"logs": rows, "last_id": store.last_id,
+                              "epoch": store.epoch, "counts": store.counts()},
+                             headers={"Cache-Control": "no-store"})
+
+
+async def handle_api_logs_export(request: web.Request) -> web.Response:
+    """Whole buffer (or the last ?n= lines) of the chosen filter as plain text. ?dl=1 downloads."""
+    store = bot_state.logstore
+    fname = str(request.query.get("f", "all")).lower()
+    entries = store.query(0, _log_filter(request), _qint(request.query.get("n")))
+    body = (f"# log export {time.strftime('%Y-%m-%d %H:%M:%S')} filter={fname} lines={len(entries)}\n"
+            + "\n".join(format_log_line(e) for e in entries) + "\n")
+    headers = {"Cache-Control": "no-store"}
+    if request.query.get("dl"):
+        headers["Content-Disposition"] = f'attachment; filename="log-{fname}-{time.strftime("%Y%m%d-%H%M%S")}.txt"'
+    return web.Response(text=body, content_type="text/plain", charset="utf-8", headers=headers)
+
+
+async def handle_api_log_line(request: web.Request) -> web.Response:
+    e = bot_state.logstore.get(_qint(request.query.get("id")))
+    if not e:
+        return web.Response(text="(line no longer in buffer)", content_type="text/plain", charset="utf-8")
+    return web.Response(text=format_log_line(e), content_type="text/plain", charset="utf-8")
 
 
 # ==================== START WEB DASHBOARD ====================
@@ -1033,6 +1180,8 @@ async def start_web_dashboard(host: str = "0.0.0.0", port: int = int(os.environ.
     app.router.add_get("/api/guildinfo", handle_api_guild_info)
     app.router.add_get("/api/stats", handle_get_stats)
     app.router.add_get("/api/logs", handle_api_logs)
+    app.router.add_get("/api/logs/export", handle_api_logs_export)
+    app.router.add_get("/api/logs/line", handle_api_log_line)
     app.router.add_post("/api/account/add", handle_add_account)
     app.router.add_post("/api/account/delete", handle_delete_account)
     app.router.add_post("/api/account/refresh", handle_refresh_account)
