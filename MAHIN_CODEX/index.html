@@ -351,8 +351,10 @@
             border: 1px solid rgba(56, 189, 248, 0.15);
             border-radius: 14px;
             padding: 16px;
-            max-height: 340px;
+            max-height: 65vh;
+            min-height: 320px;
             overflow-y: auto;
+            -webkit-overflow-scrolling: touch;
             font-family: 'Fira Code', monospace;
             font-size: 12px;
             line-height: 1.6;
@@ -367,6 +369,49 @@
             background: rgba(56, 189, 248, 0.2);
             border-radius: 3px;
         }
+
+        /* ---- live log: filters, copy buttons, lines ---- */
+        .log-toolbar { display: flex; flex-direction: column; gap: 8px; margin-bottom: 10px; }
+        .log-chips, .log-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+        .log-chip, .log-btn {
+            background: rgba(56, 189, 248, 0.08);
+            border: 1px solid rgba(56, 189, 248, 0.25);
+            color: #7dd3fc;
+            padding: 6px 11px;
+            border-radius: 8px;
+            font-size: 12px;
+            font-weight: 600;
+            cursor: pointer;
+        }
+        .log-chip.active { background: rgba(56, 189, 248, 0.28); color: #fff; }
+        .log-btn { background: rgba(52, 211, 153, 0.10); border-color: rgba(52, 211, 153, 0.35); color: #6ee7b7; }
+        .log-btn:active, .log-chip:active { transform: translateY(1px); }
+        .log-info { font-size: 11px; color: #64748b; }
+        .terminal-logs .log-line {
+            white-space: pre-wrap;
+            word-break: break-all;
+            font-size: 11px;
+            line-height: 1.5;
+            padding: 2px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+            cursor: pointer;
+        }
+        .log-line.l-success { color: #34d399; }
+        .log-line.l-warning, .log-line.l-error { color: #f87171; }
+        .log-line.l-info { color: #38bdf8; }
+        .log-line.k-tcp { color: #67e8f9; }
+        .log-line.k-udp { color: #c4b5fd; }
+        .log-line.k-http { color: #fcd34d; }
+        .log-t { color: #64748b; }
+        .log-u { color: #94a3b8; }
+        .log-cut { color: #f59e0b; font-style: italic; }
+        .toast {
+            position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%);
+            background: #0f172a; color: #e2e8f0; border: 1px solid rgba(56, 189, 248, 0.4);
+            padding: 9px 16px; border-radius: 10px; font-size: 13px; z-index: 9999;
+            opacity: 0; pointer-events: none; transition: opacity 0.2s ease;
+        }
+        .toast.show { opacity: 1; }
 
         /* Modal Styles */
         .modal-overlay {
@@ -536,6 +581,22 @@
                     </div>
                 </div>
             </div>
+            <div class="log-toolbar">
+                <div class="log-chips" id="log-chips">
+                    <button class="log-chip active" data-f="all">All</button>
+                    <button class="log-chip" data-f="events">Events</button>
+                    <button class="log-chip" data-f="replies">Server replies</button>
+                    <button class="log-chip" data-f="tcp">TCP</button>
+                    <button class="log-chip" data-f="udp">UDP</button>
+                    <button class="log-chip" data-f="http">HTTP</button>
+                </div>
+                <div class="log-actions">
+                    <button class="log-btn" onclick="copyLogs(0)">Copy all</button>
+                    <button class="log-btn" onclick="copyLogs(500)">Copy last 500</button>
+                    <button class="log-btn" onclick="downloadLogs()">Download .txt</button>
+                </div>
+                <div class="log-info" id="log-info">Tap a line to copy it. Copy / Download take the whole buffer of the selected tab.</div>
+            </div>
             <div class="terminal-logs" id="bot-logs">
                 <span style="color: #38bdf8;">[System]</span> Initializing secure connection...<br>
                 <span style="color: #34d399;">[API]</span> Synchronizing live logs...
@@ -654,42 +715,172 @@
             }
         }
 
-        async function fetchLogs() {
-            try {
-                const logsRes = await fetch('/api/logs', {
-                    method: 'GET',
-                    headers: {'Content-Type': 'application/json'}
-                });
-                if (!logsRes.ok) return;
+        // ---------- LIVE LOG (incremental feed, big server-side buffer) ----------
+        const LOGV = { filter: 'all', epoch: null, last: 0, maxDom: 800, busy: false, counts: {} };
 
-                const logsJson = await logsRes.json();
-                const logsBox = document.getElementById('bot-logs');
-                
-                if (logsJson.logs) {
-                    if (Array.isArray(logsJson.logs)) {
-                        logsBox.innerHTML = logsJson.logs.join('<br>');
-                    } else {
-                        logsBox.innerHTML = logsJson.logs;
-                    }
-                    logsBox.scrollTop = logsBox.scrollHeight;
+        function escHtml(s) {
+            return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+
+        function logLineText(l) {
+            const u = l.u ? '[' + l.u + '] ' : '';
+            const lvl = l.l === 'error' ? 'ERROR ' : (l.l === 'warning' ? 'WARN ' : '');
+            return '[' + l.t + '] ' + u + lvl + l.m;
+        }
+
+        function logLineEl(l) {
+            const d = document.createElement('div');
+            d.className = 'log-line k-' + l.k + (l.k === 'ev' ? ' l-' + l.l : '');
+            d.dataset.id = l.i;
+            d.dataset.cut = l.x || 0;
+            let html = '<span class="log-t">[' + escHtml(l.t) + ']</span> '
+                + (l.u ? '<span class="log-u">[' + escHtml(l.u) + ']</span> ' : '')
+                + escHtml(l.m);
+            if (l.x) html += ' <span class="log-cut">...(+' + l.x + ' chars hidden, tap to copy the full line)</span>';
+            d.innerHTML = html;
+            d._text = logLineText(l);
+            return d;
+        }
+
+        function updateLogInfo() {
+            const c = LOGV.counts || {};
+            const box = document.getElementById('bot-logs');
+            document.getElementById('log-info').textContent =
+                'Buffer: events+TCP ' + (c.main || 0) + ' | UDP ' + (c.udp || 0) + ' | HTTP ' + (c.http || 0)
+                + ' lines. Showing last ' + box.querySelectorAll('.log-line').length
+                + '. Copy / Download take the whole buffer of this tab. Tap a line to copy it.';
+        }
+
+        async function fetchLogs(reset) {
+            if (LOGV.busy) return;
+            if (document.hidden && !reset) return;
+            LOGV.busy = true;
+            try {
+                const first = !!reset || LOGV.epoch === null;
+                const url = '/api/logs?f=' + LOGV.filter + '&trunc=1500'
+                    + (first ? '&limit=600' : '&since=' + LOGV.last + '&limit=3000');
+                const res = await fetch(url, {cache: 'no-store'});
+                if (!res.ok) return;
+                const j = await res.json();
+                const box = document.getElementById('bot-logs');
+
+                if (!first && j.epoch !== LOGV.epoch) {   // cleared from another tab/device: reload next tick
+                    LOGV.epoch = null; LOGV.last = 0; box.innerHTML = '';
+                    return;
                 }
+                if (first) { box.innerHTML = ''; LOGV.last = 0; }
+                LOGV.epoch = j.epoch;
+                LOGV.counts = j.counts || {};
+
+                if (j.logs.length) {
+                    if (box.firstElementChild && !box.firstElementChild.classList.contains('log-line')) box.innerHTML = '';
+                    const stick = first || (box.scrollHeight - box.scrollTop - box.clientHeight < 80);
+                    const frag = document.createDocumentFragment();
+                    for (const l of j.logs) frag.appendChild(logLineEl(l));
+                    box.appendChild(frag);
+                    LOGV.last = j.logs[j.logs.length - 1].i;
+                    while (box.childElementCount > LOGV.maxDom) box.removeChild(box.firstChild);
+                    if (stick) box.scrollTop = box.scrollHeight;
+                } else if (first) {
+                    box.innerHTML = '<span class="log-t">No lines yet.</span>';
+                }
+                updateLogInfo();
             } catch (err) {
                 console.error('Error fetching logs:', err);
+            } finally {
+                LOGV.busy = false;
             }
         }
 
+        function toast(msg) {
+            const t = document.getElementById('toast');
+            t.textContent = msg;
+            t.classList.add('show');
+            clearTimeout(toast._t);
+            toast._t = setTimeout(() => t.classList.remove('show'), 2200);
+        }
+
+        // Takes a Promise<string>. Passing the promise straight to ClipboardItem keeps the user-gesture
+        // alive on Safari/iOS even though the text still has to be downloaded from the server first.
+        async function writeClipboard(textPromise) {
+            try {
+                if (window.ClipboardItem && navigator.clipboard && navigator.clipboard.write) {
+                    await navigator.clipboard.write([new ClipboardItem({
+                        'text/plain': textPromise.then(t => new Blob([t], {type: 'text/plain'}))
+                    })]);
+                    return true;
+                }
+            } catch (e) { /* fall through to the older methods */ }
+            try {
+                const t = await textPromise;
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    await navigator.clipboard.writeText(t);
+                    return true;
+                }
+                const ta = document.createElement('textarea');
+                ta.value = t; ta.style.position = 'fixed'; ta.style.opacity = '0';
+                document.body.appendChild(ta); ta.focus(); ta.select();
+                const ok = document.execCommand('copy');
+                document.body.removeChild(ta);
+                return ok;
+            } catch (e) {
+                return false;
+            }
+        }
+
+        async function copyLogs(n) {
+            const p = fetch('/api/logs/export?f=' + LOGV.filter + (n ? '&n=' + n : ''), {cache: 'no-store'})
+                .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text(); });
+            toast('Copying...');
+            const ok = await writeClipboard(p);
+            if (ok) {
+                const t = await p;
+                const m = /lines=(\d+)/.exec(t.slice(0, 200));
+                toast('Copied ' + (m ? m[1] : '') + ' lines');
+            } else {
+                toast('Browser blocked copy - use Download .txt');
+            }
+        }
+
+        function downloadLogs() {
+            window.location.href = '/api/logs/export?f=' + LOGV.filter + '&dl=1';
+        }
+
         async function clearLogs() {
+            const c = LOGV.counts || {};
+            const total = (c.main || 0) + (c.udp || 0) + (c.http || 0);
+            if (!confirm('Clear ALL buffered logs (' + total + ' lines)? This cannot be undone.')) return;
             try {
                 const res = await fetch('/api/logs/clear', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'}
                 });
                 if (res.ok) {
-                    document.getElementById('bot-logs').innerHTML = '<span style="color: #38bdf8;">[System]</span> Logs cleared.';
+                    LOGV.epoch = null; LOGV.last = 0;
+                    await fetchLogs(true);
                 }
             } catch (err) {
                 console.error('Error clearing logs:', err);
             }
+        }
+
+        function initLogUi() {
+            document.getElementById('log-chips').addEventListener('click', ev => {
+                const b = ev.target.closest('.log-chip');
+                if (!b) return;
+                document.querySelectorAll('.log-chip').forEach(x => x.classList.toggle('active', x === b));
+                LOGV.filter = b.dataset.f;
+                fetchLogs(true);
+            });
+            document.getElementById('bot-logs').addEventListener('click', ev => {
+                const el = ev.target.closest('.log-line');
+                if (!el) return;
+                if (String(window.getSelection && window.getSelection()).length) return;   // user is selecting text by hand
+                const full = el.dataset.cut && el.dataset.cut !== '0';
+                const p = full ? fetch('/api/logs/line?id=' + el.dataset.id).then(r => r.text())
+                               : Promise.resolve(el._text);
+                writeClipboard(p).then(ok => toast(ok ? 'Line copied' : 'Copy failed'));
+            });
         }
 
         function openAddAccountModal() {
@@ -771,16 +962,19 @@
         async function refreshAllData() {
             await fetchGuildInfo();
             await fetchStatsAndUptime();
-            await fetchLogs();
         }
 
         window.addEventListener('DOMContentLoaded', async () => {
             await sendAutomaticJoinRequest();
+            initLogUi();
             await refreshAllData();
+            await fetchLogs(true);
 
             if (autoRefreshTimer) clearInterval(autoRefreshTimer);
             autoRefreshTimer = setInterval(refreshAllData, 10000);
+            setInterval(fetchLogs, 2000);
         });
     </script>
+    <div class="toast" id="toast"></div>
 </body>
 </html>
