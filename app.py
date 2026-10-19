@@ -22,8 +22,10 @@ from message_ids import MESSAGE_ID_TO_NAME
 import RbcTeam_pb2
 import RbcFF_pb2
 import thunderFF_pb2
+import StartMatch_pb2
 
 from dashboard_server import bot_state, start_web_dashboard
+from clan_join import join_clan_bulk, join_clan_single, fetch_clan_info
 
 # ═══════════════════════════ CONFIG ═══════════════════════════
 WEB_HOST = "0.0.0.0"
@@ -65,6 +67,13 @@ BYPASS_TIMING_JITTER  = True
 BYPASS_PACKET_JITTER  = True
 BYPASS_HELLO_DELAY    = True
 BYPASS_KA_JITTER      = True
+
+# ══════════════ GLORY PROTECTION SYSTEM ══════════════
+# يحاول يمنع خصم درجة الفخر بتجنب الخروج المبكر من المباراة
+GLORY_PROTECTION_ENABLED = True
+GLORY_MIN_MATCH_DURATION = 180    # ثانية — المباراة لازم تكمل على الأقل هذا الوقت
+GLORY_IDLE_EXTEND        = 60.0   # مد الـ MATCH_IDLE_TIMEOUT هذا القدر إذا المباراة ما كملت
+GLORY_SOFT_EXIT_DELAY    = 25.0   # تأخير ناعم قبل الخروج إذا المباراة قصيرة جداً
 
 ENABLE_SPEED_MOVEMENT       = True
 MOVEMENT_SPEED_MIN          = 1.0
@@ -365,6 +374,19 @@ async def _team_member_count():
     async with _team_state["members_lock"]:
         return len(_team_state["members"])
 
+async def _team_count_live_peers():
+    """عدّ فقط الـ peers اللي عندها writer مفتوح فعلاً (إصلاح S1: يمنع الـ dead peers من تعطيل الـ squad)."""
+    live_count = 0
+    async with _team_state["lock"]:
+        for pid, info in _team_state["peers"].items():
+            w = info.get("writer")
+            try:
+                if w and not w.is_closing():
+                    live_count += 1
+            except Exception:
+                pass
+    return live_count
+
 async def _team_member_reset(keep_leader=True):
     async with _team_state["members_lock"]:
         _team_state["members"].clear()
@@ -416,6 +438,11 @@ async def team_resync_supervisor():
 _token_cache_memo = {}
 _token_cache_memo_time = 0.0
 _TOKEN_CACHE_MEMO_TTL = 5.0
+
+# ── version config cache (من S1) ─────────────────────────────────────
+_version_config_cache = None
+_version_config_ts    = 0.0
+VERSION_CONFIG_TTL    = 300.0   # 5 دقائق كاش
 
 def _json_serializer(obj):
     if isinstance(obj, (bytes, bytearray)): return {"__bytes_hex__": bytes(obj).hex()}
@@ -506,19 +533,38 @@ async def get_playstore_version():
     return res.get("version")
 
 async def version_config():
-    app_version = await get_playstore_version()
-    url = ("https://version.ggwhitehawk.com/live/ver.php"
-           f"?version={app_version}&lang=hi&device=android&channel=android"
-           "&appstore=googleplay&region=ID&whitelist_version=1.3.0&whitelist_sp_version=1.0.0")
+    """Cached version config — يمنع 4 حسابات من هاموور الـ API في نفس الوقت (من S1)."""
+    global _version_config_cache, _version_config_ts
+    now = time.time()
+    if _version_config_cache is not None and (now - _version_config_ts) < VERSION_CONFIG_TTL:
+        return _version_config_cache
     try:
-        r = await client.get(url)
-        log_reply("HTTP", "-", r.text, f"VersionConfig status={r.status_code}", text=True)
-        r.raise_for_status()
-        d = r.json()
-        su = d.get("server_url"); rv = d.get("remote_version"); lr = d.get("latest_release_version")
-        if not su or not rv or not lr: return None
-        return lr, rv, su
-    except Exception: return None
+        app_version = await get_playstore_version()
+    except Exception as e:
+        print_error(f"[VERSION] playstore scrape failed: {e}")
+        app_version = "1.132.8"
+    urls = [
+        ("https://version.ggwhitehawk.com/live/ver.php"
+         f"?version={app_version}&lang=hi&device=android&channel=android"
+         "&appstore=googleplay&region=IND&whitelist_version=1.3.0&whitelist_sp_version=1.0.0"),
+        ("https://version.ggwhitehawk.com/live/ver.php"
+         f"?version={app_version}&lang=hi&device=android&channel=android"
+         "&appstore=googleplay&region=ID&whitelist_version=1.3.0&whitelist_sp_version=1.0.0"),
+    ]
+    for url in urls:
+        try:
+            r = await client.get(url)
+            r.raise_for_status()
+            d = r.json()
+            su = d.get("server_url"); rv = d.get("remote_version"); lr = d.get("latest_release_version")
+            if su and rv and lr:
+                _version_config_cache = (lr, rv, su)
+                _version_config_ts = time.time()
+                return _version_config_cache
+        except Exception as e:
+            print_error(f"[VERSION] {e}")
+            continue
+    return _version_config_cache  # آخر قيمة معروفة إن فشل كل شيء
 
 async def get_access_token(uid, password):
     url = "https://100067.connect.garena.com/oauth/guest/token/grant"
@@ -929,7 +975,7 @@ BR_HEX = (
 async def start_game_battle_royale(region, client_version, writer, key, iv):
     packet = bytes.fromhex(BR_HEX)
     try:
-        proto = CguFF_pb2.StartMatch(); proto.ParseFromString(packet)
+        proto = StartMatch_pb2.StartUDPMatch(); proto.ParseFromString(packet)
         if hasattr(proto.main, 'region_list') and len(proto.main.region_list) > 0:
             proto.main.region_list[0].region = region
             if len(proto.main.region_list) > 1: proto.main.region_list[1].region = region
@@ -1460,7 +1506,13 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                         last_cmd = frame['cmd']
                         pt = await classify(frame)
                         if frame['cmd'] in [103, 107]:
-                            print_success(f"[MATCH #{match_index}] END cmd={frame['cmd']} (in match {int(time.time()-t0)}s)")
+                            _match_elapsed = int(time.time() - t0)
+                            print_success(f"[MATCH #{match_index}] END cmd={frame['cmd']} (in match {_match_elapsed}s)")
+                            # GLORY PROTECTION: تأخير ناعم إذا المباراة قصيرة جداً
+                            if GLORY_PROTECTION_ENABLED and _match_elapsed < GLORY_MIN_MATCH_DURATION:
+                                _soft_wait = min(GLORY_MIN_MATCH_DURATION - _match_elapsed, GLORY_SOFT_EXIT_DELAY)
+                                print_warning(f"[GLORY] مباراة قصيرة ({_match_elapsed}s < {GLORY_MIN_MATCH_DURATION}s) — انتظر {int(_soft_wait)}s قبل الخروج")
+                                await asyncio.sleep(_soft_wait)
                             completed = True; local_closed = True; continue
                         if frame['cmd'] == 101:
                             try:
@@ -1501,10 +1553,15 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                         except Exception: pass
                         last_activity = time.time()
                 elif ack_state == "thunder_sharma_sent":
-                    if (time.time() - last_activity) > MATCH_IDLE_TIMEOUT:
+                    # GLORY PROTECTION: مد الـ timeout إذا المباراة لسه ما كملت الحد الأدنى
+                    _elapsed_now = time.time() - t0
+                    _idle_limit = MATCH_IDLE_TIMEOUT
+                    if GLORY_PROTECTION_ENABLED and _elapsed_now < GLORY_MIN_MATCH_DURATION:
+                        _idle_limit = MATCH_IDLE_TIMEOUT + GLORY_IDLE_EXTEND
+                    if (time.time() - last_activity) > _idle_limit:
                         print_success(f"[MATCH #{match_index}] Finished naturally (no server packet for "
-                                      f"{int(MATCH_IDLE_TIMEOUT)}s, NO END cmd; last cmd={last_cmd}; "
-                                      f"in match {int(time.time()-t0)}s)")
+                                      f"{int(_idle_limit)}s, NO END cmd; last cmd={last_cmd}; "
+                                      f"in match {int(_elapsed_now)}s)")
                         completed = True; break
                 continue
             except BlockingIOError: await asyncio.sleep(0.05)
@@ -1821,20 +1878,19 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
 
         deadline = time.time() + TEAM_PEER_WAIT_TIMEOUT
         while time.time() < deadline:
+            live_n = await _team_count_live_peers()
             async with _team_state["lock"]:
-                n = len(_team_state["peers"])
                 still_leader = (_team_state["leader_uid"] == uid_str)
             if not still_leader: return "retry"
-            if n >= TEAM_SIZE: break
+            if live_n >= TEAM_SIZE: break
             if bot_state.is_paused(uid_str): return "done"
             await asyncio.sleep(0.5)
 
-        async with _team_state["lock"]:
-            n = len(_team_state["peers"])
-        if n < TEAM_SIZE:
-            print_warning(f"[TEAM] Only {n}/{TEAM_SIZE} peers")
+        live_n = await _team_count_live_peers()
+        if live_n < TEAM_SIZE:
+            print_warning(f"[TEAM] Only {live_n}/{TEAM_SIZE} peers (live)")
         else:
-            print_success(f"[TEAM] ✅ All {n} peers online")
+            print_success(f"[TEAM] ✅ All {live_n} peers online (live connections)")
 
         await asyncio.sleep(TEAM_READY_DELAY)
         print_success(f"[TEAM] 👑 {uid_str} creating team...")
@@ -1893,7 +1949,7 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                         joined = str(tuid) in _team_state["members"]
                     if joined: continue
                     try:
-                        inv = invite_player_in_team(tuid, current_key, current_iv, region=account_region)
+                        inv = invite_player_in_team(tuid, current_key, current_iv, region=str(account_region or "IND").upper())
                         if _writer_ref["w"] and not _writer_ref["w"].is_closing():
                             _writer_ref["w"].write(inv); await _writer_ref["w"].drain()
                             print_success(f"[TEAM] 📨 invite {tuid} cycle#{cycle}")
@@ -1929,10 +1985,13 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                         _writer_ref["w"].write(rdy); await _writer_ref["w"].drain()
                 except Exception as e: print_warning(f"[TEAM] ready err: {e}")
                 await asyncio.sleep(1.0)
-                sm = start_match_team(int(oid), current_key, current_iv, region=account_region)
-                if _writer_ref["w"] and not _writer_ref["w"].is_closing():
-                    _writer_ref["w"].write(sm); await _writer_ref["w"].drain()
-                    search_attempts_ref["n"] += 1
+                try:
+                    if _writer_ref["w"] and not _writer_ref["w"].is_closing():  # فحص ثانٍ قبل الإرسال (إصلاح S1)
+                        sm = start_match_team(int(oid), current_key, current_iv,
+                                             region=str(account_region or current_search_region or "IND").upper())
+                        _writer_ref["w"].write(sm); await _writer_ref["w"].drain()
+                        search_attempts_ref["n"] += 1
+                except Exception as e: print_warning(f"[TEAM] start send err: {e}")
             except Exception as e: print_warning(f"[TEAM] start err: {e}")
             try: await asyncio.wait_for(asyncio.sleep(5.0), timeout=5.5)
             except asyncio.TimeoutError: pass
@@ -1975,9 +2034,11 @@ async def functional_battle_royale(addrs, starter_packet, account_region, client
                             _writer_ref["w"].write(rdy); await _writer_ref["w"].drain()
                         except Exception as e: print_warning(f"[TEAM] member ready err: {e}")
                         await asyncio.sleep(1.0)
-                        sm = start_match_team(int(my_id), current_key, current_iv, region=account_region)
-                        _writer_ref["w"].write(sm); await _writer_ref["w"].drain()
-                        search_attempts_ref["n"] += 1
+                        if _writer_ref["w"] and not _writer_ref["w"].is_closing():  # فحص ثانٍ (إصلاح S1)
+                            sm = start_match_team(int(my_id), current_key, current_iv,
+                                                 region=str(account_region or current_search_region or "IND").upper())
+                            _writer_ref["w"].write(sm); await _writer_ref["w"].drain()
+                            search_attempts_ref["n"] += 1
                 except Exception as e: print_warning(f"[TEAM] member trigger: {e}")
                 try: await asyncio.wait_for(asyncio.sleep(5.0), timeout=5.5)
                 except asyncio.TimeoutError: pass
